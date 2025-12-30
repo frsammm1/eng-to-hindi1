@@ -40,7 +40,7 @@ userbot_active = False
 user_states = {}
 
 # --- Engine ---
-engine = TransferEngine(bot_client=bot, user_client=userbot)
+engine = TransferEngine(bot, userbot)
 
 # --- Helper: Conversation Reset ---
 def reset_state(user_id):
