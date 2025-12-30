@@ -4,6 +4,7 @@ from pyrogram import Client, filters, idle
 from config import Config
 from database import check_connection, create_job, cancel_job, get_active_job
 from transfer_service import TransferEngine
+from utils import parse_message_link
 
 # Configure logging
 logging.basicConfig(
@@ -15,159 +16,161 @@ logger = logging.getLogger(__name__)
 # Validate Config
 Config.validate()
 
-# Check Database Connection
 if not check_connection():
-    logger.error("Could not connect to MongoDB. Exiting...")
     exit(1)
 
-# --- Initialize Clients ---
-
-# 1. Bot Client (Interface)
-bot = Client(
-    "ssc_transfer_bot",
-    api_id=Config.API_ID,
-    api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
-)
-
-# 2. User Client (Worker)
-# This will trigger interactive login if 'my_userbot.session' is missing
-userbot = Client(
+# Initialize Single Userbot Client
+app = Client(
     "my_userbot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH
 )
 
-# Initialize Engine with BOTH clients
-engine = TransferEngine(bot_client=bot, user_client=userbot)
+engine = TransferEngine(app)
 
-# --- Bot Commands ---
+# --- Conversation State Management ---
+# Map user_id -> {step: 'wait_start_link'|'wait_end_link'|'wait_dest', data: {...}}
+user_states = {}
 
-@bot.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & filters.me)
 async def start_command(client, message):
     text = (
-        "🚀 **Telegram Content Transfer Bot**\n\n"
-        "I am the Control Interface. The **Userbot** (Worker) will handle the actual copying.\n\n"
-        "**Features:**\n"
-        "• Copy from Private Channels (Userbot access)\n"
-        "• Preserve Files, Media, Text\n"
-        "• Range Selection\n\n"
-        "**Commands:**\n"
-        "`/batch <source> <dest> <start_id> <end_id>`\n"
-        "`/cancel`\n"
-        "`/status`\n\n"
-        "**Note:** Use channel IDs (e.g., `-100xxxx`). Ensure the Userbot account has joined the source."
+        "🚀 **Telegram Smart Cloner (Userbot)**\n\n"
+        "I am running on your account. I can copy content from any channel you can access.\n\n"
+        "**Usage:**\n"
+        "1. Send `/clone` to start the wizard.\n"
+        "2. Provide the Link of the **First Message**.\n"
+        "3. Provide the Link of the **Last Message**.\n"
+        "4. Provide the **Destination Channel ID**.\n"
+        "5. Type `start` to begin.\n\n"
+        "**Other Commands:**\n"
+        "`/cancel` - Stop current job.\n"
+        "`/status` - Check progress."
     )
-    await message.reply(text)
+    await message.edit(text)
 
-@bot.on_message(filters.command("batch"))
-async def batch_command(client, message):
-    # Check permissions
-    if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
-        await message.reply("❌ Access Denied. Only the owner can use this bot.")
-        return
-
-    # Check for active job
+@app.on_message(filters.command("clone") & filters.me)
+async def clone_command(client, message):
     if get_active_job(message.from_user.id):
-        await message.reply("⚠️ You already have an active transfer job. Use `/cancel` first.")
+        await message.reply("⚠️ Active job exists. Use `/cancel` first.")
         return
 
-    # Parse arguments
-    try:
-        args = message.command
-        if len(args) != 5:
-            raise ValueError("Incorrect number of arguments")
+    user_states[message.from_user.id] = {"step": "wait_start_link", "data": {}}
+    await message.reply("🔗 **Step 1:** Send the **Link** of the **First Message** you want to copy.")
 
-        source = args[1]
-        dest = args[2]
-        start_id = int(args[3])
-        end_id = int(args[4])
-
-        # Convert IDs to int if they look like ints
-        try:
-            source = int(source)
-        except: pass
-        try:
-            dest = int(dest)
-        except: pass
-
-    except Exception:
-        await message.reply(
-            "❌ **Usage Error**\n\n"
-            "Format: `/batch <source_id> <dest_id> <start_id> <end_id>`\n"
-            "Example: `/batch -1001234 -1005678 10 50`"
-        )
-        return
-
-    # Create Job
-    try:
-        job_id = create_job(message.from_user.id, source, dest, start_id, end_id)
-        if not job_id:
-            await message.reply("❌ Database Error: Could not create job.")
-            return
-
-        # Fetch the full job object to pass to engine
-        job = get_active_job(message.from_user.id)
-
-        # Start Engine
-        await engine.start_transfer(job)
-
-    except Exception as e:
-        logger.error(f"Error starting batch: {e}")
-        await message.reply(f"❌ Error starting transfer: {e}")
-
-@bot.on_message(filters.command("cancel"))
+@app.on_message(filters.command("cancel") & filters.me)
 async def cancel_command(client, message):
-    if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
+    if message.from_user.id in user_states:
+        del user_states[message.from_user.id]
+        await message.reply("❌ Setup cancelled.")
         return
 
-    user_id = message.from_user.id
-
-    # Cancel in Engine
-    stopped = await engine.stop_transfer(user_id)
-
-    # Cancel in DB
-    cancel_job(user_id)
+    stopped = await engine.stop_transfer(message.from_user.id)
+    cancel_job(message.from_user.id)
 
     if stopped:
-        await message.reply("✅ Job stopped and cancelled.")
+        await message.reply("✅ Job stopped.")
     else:
-        await message.reply("⚠️ No active job found to cancel.")
+        await message.reply("⚠️ No active job.")
 
-@bot.on_message(filters.command("status"))
+@app.on_message(filters.command("status") & filters.me)
 async def status_command(client, message):
     job = get_active_job(message.from_user.id)
     if not job:
-        await message.reply("💤 No active transfers running.")
+        await message.reply("💤 No active job.")
+        return
+    await message.reply(f"🔄 **Processing:** {job['current_id']} / {job['end_id']}")
+
+@app.on_message(filters.text & filters.me & ~filters.command(["start", "clone", "cancel", "status", "id"]))
+async def conversation_handler(client, message):
+    user_id = message.from_user.id
+    if user_id not in user_states:
         return
 
-    await message.reply(
-        f"🔄 **Active Job:**\n"
-        f"Source: `{job['source']}`\n"
-        f"Dest: `{job['dest']}`\n"
-        f"Current ID: `{job['current_id']}` / `{job['end_id']}`\n"
-        f"Processed: `{job['processed']}`\n"
-        f"Failed: `{job['failed']}`"
-    )
+    state = user_states[user_id]
+    step = state["step"]
+    text = message.text.strip()
 
-async def main():
-    logger.info("Starting Bot Client...")
-    await bot.start()
+    # Step 1: Wait for Start Link
+    if step == "wait_start_link":
+        result = parse_message_link(text)
+        if not result:
+            await message.reply("❌ Invalid Link. Please send a valid Telegram message link.")
+            return
 
-    logger.info("Starting Userbot Client (CLI Login may be required)...")
-    await userbot.start()
+        state["data"]["source_chat"] = result[0]
+        state["data"]["start_id"] = result[1]
+        state["step"] = "wait_end_link"
 
-    me = await userbot.get_me()
-    logger.info(f"Userbot Started as: {me.first_name} (ID: {me.id})")
+        await message.reply(
+            f"✅ **Start Point Set:** Chat `{result[0]}`, Msg `{result[1]}`\n\n"
+            "🔗 **Step 2:** Send the **Link** of the **Last Message**."
+        )
 
-    bot_info = await bot.get_me()
-    logger.info(f"Bot Started as: @{bot_info.username}")
+    # Step 2: Wait for End Link
+    elif step == "wait_end_link":
+        result = parse_message_link(text)
+        if not result:
+            await message.reply("❌ Invalid Link.")
+            return
 
-    logger.info("Service is Ready. Idling...")
-    await idle()
+        # Validation: Must be same chat
+        if result[0] != state["data"]["source_chat"]:
+            await message.reply("❌ **Error:** Start and End links must be from the **same chat**.")
+            return
 
-    await bot.stop()
-    await userbot.stop()
+        state["data"]["end_id"] = result[1]
+
+        # Ensure Start < End
+        if state["data"]["start_id"] > state["data"]["end_id"]:
+            state["data"]["start_id"], state["data"]["end_id"] = state["data"]["end_id"], state["data"]["start_id"]
+
+        state["step"] = "wait_dest"
+
+        await message.reply(
+            f"✅ **Range Set:** `{state['data']['start_id']}` to `{state['data']['end_id']}`\n\n"
+            "🎯 **Step 3:** Send the **Destination Channel ID** (e.g., `-100xxxx`).\n"
+            "*(Tip: Use `/id` in the target channel to find it if I'm admin there)*"
+        )
+
+    # Step 3: Wait for Dest ID
+    elif step == "wait_dest":
+        try:
+            dest_id = int(text)
+            state["data"]["dest_chat"] = dest_id
+            state["step"] = "confirm"
+
+            await message.reply(
+                "📝 **Summary:**\n"
+                f"Source: `{state['data']['source_chat']}`\n"
+                f"Dest: `{dest_id}`\n"
+                f"Range: `{state['data']['start_id']}` - `{state['data']['end_id']}`\n\n"
+                "🚀 Type **start** to begin."
+            )
+        except ValueError:
+            await message.reply("❌ Invalid ID. Please send a numeric Chat ID (e.g. -100123456).")
+
+    # Step 4: Confirm Start
+    elif step == "confirm":
+        if text.lower() == "start":
+            # Create Job
+            data = state["data"]
+            job_id = create_job(user_id, data["source_chat"], data["dest_chat"], data["start_id"], data["end_id"])
+
+            if job_id:
+                del user_states[user_id]
+                job = get_active_job(user_id)
+                await message.reply("✅ Job Created. Starting Transfer...")
+                await engine.start_transfer(job)
+            else:
+                await message.reply("❌ Error creating job.")
+        else:
+            await message.reply("❌ Type `start` to confirm or `/cancel` to abort.")
+
+@app.on_message(filters.command("id") & filters.me)
+async def id_command(client, message):
+    await message.reply(f"Chat ID: `{message.chat.id}`")
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    logger.info("Starting Userbot...")
+    app.run()

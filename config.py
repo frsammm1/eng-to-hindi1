@@ -17,7 +17,7 @@ class Config:
         missing = []
         if not cls.API_ID: missing.append("API_ID")
         if not cls.API_HASH: missing.append("API_HASH")
-        if not cls.BOT_TOKEN: missing.append("BOT_TOKEN")
+        # BOT_TOKEN removed as per request for Userbot-only workflow
         if not cls.MONGO_URI: missing.append("MONGO_URI")
 
         if missing:
