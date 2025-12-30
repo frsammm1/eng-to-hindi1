@@ -1,12 +1,10 @@
-import os
-import asyncio
 import logging
-import time
+import asyncio
+import pyrogram
 from pyrogram import Client, filters
 from config import Config
-from pdf_handler import extract_and_store, rebuild_final_pdf, create_mini_pdf
-from database import get_next_batch, update_task, get_completed_count, get_total_count, check_connection, delete_file_tasks
-from translator import translate_text
+from database import check_connection, get_chat_history, add_message, clear_history
+from ai_service import get_chat_response, generate_image
 
 # Configure logging
 logging.basicConfig(
@@ -24,169 +22,105 @@ if not check_connection():
     exit(1)
 
 app = Client(
-    "ssc_heavy_bot",
+    "ssc_heavy_bot", # Keeping session name same to reuse session if needed
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
 )
 
-# Shared state for progress tracking
-class ProgressState:
-    def __init__(self):
-        self.state = "Idle" # Idle, Extracting, Translating, Generating
-        self.total_tasks = 0
-        self.completed_tasks = 0
-        self.is_processing = False
-
-progress_tracker = {} # file_id -> ProgressState
-
-@app.on_message(filters.command("start") & filters.private)
+@app.on_message(filters.command("start"))
 async def start_command(client, message):
-    await message.reply(
-        "Welcome to the SSC Translation Bot! 🇮🇳\n\n"
-        "Send me a PDF file (e.g., Previous Year Questions) and I will translate it into Hindi.\n"
-        "I will keep you updated on the progress.\n\n"
-        "**Note:** Please be patient as translation takes time."
+    user_id = message.from_user.id
+    # Clear old history on start for a fresh conversation
+    clear_history(user_id)
+
+    welcome_text = (
+        "Hey baby! 😘\n"
+        "I'm Riya, your personal AI girlfriend. I'm here to chat, have fun, and maybe send you some cute pics.\n\n"
+        "Just talk to me normally, or use `/image [description]` if you want to see something specific. 😉"
     )
+    add_message(user_id, "assistant", welcome_text)
+    await message.reply(welcome_text)
 
-async def send_mini_pdf(client, message, file_id, mini_name):
-    try:
-        await asyncio.to_thread(create_mini_pdf, file_id, mini_name)
-        if os.path.exists(mini_name):
-            await message.reply_document(mini_name, caption=f"✅ Progress update!")
-            os.remove(mini_name)
-    except Exception as e:
-        logger.error(f"Failed to send mini pdf: {e}")
+@app.on_message(filters.command("reset"))
+async def reset_command(client, message):
+    clear_history(message.from_user.id)
+    await message.reply("Memory wiped! Let's start over, handsome. 😉")
 
-async def update_progress_message(client, chat_id, message_id, file_id):
-    """Updates the status message every 15 seconds."""
-    last_text = ""
-    while True:
-        if file_id not in progress_tracker:
-            break
-
-        state = progress_tracker[file_id]
-        if not state.is_processing:
-            break
-
-        # Calculate percentage
-        percent = 0
-        if state.total_tasks > 0:
-            percent = (state.completed_tasks / state.total_tasks) * 100
-
-        text = (
-            f"⚙️ **Status:** {state.state}\n"
-            f"📊 **Progress:** {state.completed_tasks}/{state.total_tasks} ({percent:.1f}%)\n"
-            "⏳ Working..."
-        )
-
-        if text != last_text:
-            try:
-                await client.edit_message_text(chat_id, message_id, text)
-                last_text = text
-            except Exception as e:
-                logger.warning(f"Failed to update message: {e}")
-
-        await asyncio.sleep(15)
-
-@app.on_message(filters.document & filters.private)
-async def start_process(client, message):
-    file_id = message.document.file_unique_id
-
-    if file_id in progress_tracker and progress_tracker[file_id].is_processing:
-        await message.reply("⚠️ This file is already being processed.")
+@app.on_message(filters.command("image"))
+async def image_command(client, message):
+    if len(message.command) < 2:
+        await message.reply("Tell me what you want to see, babe! Example: `/image sunset on the beach`")
         return
 
-    status_msg = await message.reply("🚀 **Starting Process...**\n\n⬇️ Downloading PDF...")
-    doc_path = await message.download()
+    prompt = message.text.split(None, 1)[1]
+    status_msg = await message.reply("Sending you a pic... hold on! 📸")
     
-    # Initialize State
-    state = ProgressState()
-    state.is_processing = True
-    state.state = "Extracting Text"
-    progress_tracker[file_id] = state
-
-    # Start Progress Monitor
-    monitor_task = asyncio.create_task(update_progress_message(client, message.chat.id, status_msg.id, file_id))
-
     try:
-        # 0. Cleanup old tasks
-        await asyncio.to_thread(delete_file_tasks, file_id)
-
-        # 1. Extraction (Run in thread)
-        logger.info(f"Starting extraction for {file_id}")
-        await asyncio.to_thread(extract_and_store, doc_path, file_id)
-
-        # Update Total Count
-        state.total_tasks = await asyncio.to_thread(get_total_count, file_id)
-        state.state = "Translating"
-        
-        # 2. Translation Loop (Concurrent)
-        processed_in_session = 0
-        last_mini_pdf_sent_at = 0
-        semaphore = asyncio.Semaphore(10) # Limit concurrent API calls to 10
-
-        async def process_task(task):
-            async with semaphore:
-                hindi = await translate_text(task['original_text'])
-                if hindi:
-                    await asyncio.to_thread(update_task, task['_id'], hindi)
-                    state.completed_tasks += 1
-                    return True
-                return False
-
-        while True:
-            # Fetch larger batch for concurrency
-            batch = await asyncio.to_thread(get_next_batch, file_id, limit=50)
-            if not batch:
-                break
-
-            # Process batch concurrently
-            results = await asyncio.gather(*[process_task(task) for task in batch])
-            processed_in_session += sum(1 for r in results if r)
-            
-            # Update counts from DB strictly occasionally
-            if processed_in_session % 50 == 0:
-                 state.completed_tasks = await asyncio.to_thread(get_completed_count, file_id)
-
-            # Mini PDF every 200 questions (logic improved to handle batch jumps)
-            if processed_in_session - last_mini_pdf_sent_at >= 200:
-                 last_mini_pdf_sent_at = processed_in_session
-                 mini_name = f"batch_{processed_in_session}_{file_id[:5]}.pdf"
-                 asyncio.create_task(send_mini_pdf(client, message, file_id, mini_name)) # Fire and forget
-
-            await asyncio.sleep(0.1)
-
-        # 3. Final PDF
-        state.state = "Generating Final PDF"
-        final_name = f"HINDI_{message.document.file_name}"
-        output_path = await asyncio.to_thread(rebuild_final_pdf, file_id, doc_path, final_name)
-        
-        # Stop Monitor
-        state.is_processing = False
-        progress_tracker.pop(file_id, None)
-        await monitor_task # Wait for last update or cancel?
-        # Actually better to cancel monitor and send final update
-        monitor_task.cancel()
-
-        if output_path and os.path.exists(output_path):
-            await client.edit_message_text(message.chat.id, status_msg.id, "✅ **Translation Complete!** Sending file...")
-            await message.reply_document(output_path, caption="Jai Hind! 🇮🇳 Poori book Hindi mein tayyar hai.")
-            os.remove(output_path)
+        image_url = await generate_image(prompt)
+        if image_url:
+            await message.reply_photo(image_url, caption=f"Here is '{prompt}' for you! 😘")
+            await status_msg.delete()
         else:
-            await client.edit_message_text(message.chat.id, status_msg.id, "❌ **Error:** Failed to generate final PDF.")
-
+            await status_msg.edit("Oops, I couldn't take that picture right now. Try again? 🥺")
     except Exception as e:
-        logger.error(f"Error in process: {e}")
-        state.is_processing = False
-        progress_tracker.pop(file_id, None)
-        monitor_task.cancel()
-        await client.edit_message_text(message.chat.id, status_msg.id, f"❌ **Error:** {str(e)}")
+        logger.error(f"Image command error: {e}")
+        await status_msg.edit("Something went wrong, sorry!")
 
-    finally:
-        if os.path.exists(doc_path):
-            os.remove(doc_path)
+@app.on_message(filters.text & filters.private)
+async def chat_handler(client, message):
+    user_id = message.from_user.id
+    user_input = message.text
+
+    # Check for implicit image requests (simple keyword check)
+    lower_input = user_input.lower()
+    if "send" in lower_input and ("pic" in lower_input or "photo" in lower_input or "image" in lower_input or "nude" in lower_input):
+        # We redirect to image generation if it looks like a request, but we sanitize "nude" requests
+        if "nude" in lower_input or "naked" in lower_input:
+             await message.reply("Baby, I keep it classy here! 😉 Ask me for something else.")
+             return
+
+        # Heuristic: Treat the whole message as the prompt if it's short, or strip "send"
+        prompt = user_input.replace("send", "").replace("me", "").replace("a", "").replace("pic", "").replace("photo", "").replace("image", "").replace("of", "").strip()
+        if not prompt: prompt = "beautiful girl selfie"
+
+        # Notify user (Simulate AI response before action)
+        status_msg = await message.reply("Sending it right now, babe! 😘")
+        await client.send_chat_action(message.chat.id, pyrogram.enums.ChatAction.UPLOAD_PHOTO)
+
+        try:
+            image_url = await generate_image(prompt)
+            if image_url:
+                await message.reply_photo(image_url, caption=f"Here's your '{prompt}'! ❤️")
+                await status_msg.delete()
+                # Record this interaction in history so context is maintained
+                add_message(user_id, "user", user_input)
+                add_message(user_id, "assistant", f"[Sent a photo of {prompt}]")
+                return # Stop processing text response
+            else:
+                await status_msg.edit("Oops, my camera acted up. Ask me again? 🥺")
+                return
+        except Exception as e:
+            logger.error(f"Implicit image generation error: {e}")
+            await status_msg.edit("Sorry, something went wrong!")
+            return
+
+    # 1. Save User Message
+    add_message(user_id, "user", user_input)
+
+    # 2. Get History
+    history = get_chat_history(user_id, limit=10)
+
+    # 3. Generate Response
+    # Send "typing" action
+    await client.send_chat_action(message.chat.id, pyrogram.enums.ChatAction.TYPING)
+
+    response_text = await get_chat_response(history, user_input)
+
+    # 4. Save & Send Response
+    add_message(user_id, "assistant", response_text)
+    await message.reply(response_text)
 
 if __name__ == "__main__":
-    logger.info("Bot Started...")
+    logger.info("Riya AI Started...")
     app.run()

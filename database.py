@@ -1,89 +1,56 @@
-import logging
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
 from config import Config
+import logging
 
-client = MongoClient(Config.MONGO_URI)
-db = client['heavy_translator_db']
+logger = logging.getLogger(__name__)
+
+client = None
+db = None
+chats_collection = None
 
 def check_connection():
+    global client, db, chats_collection
     try:
-        # The ismaster command is cheap and does not require auth.
-        client.admin.command('ismaster')
-        logging.info("MongoDB connection successful.")
+        client = MongoClient(Config.MONGO_URI)
+        db = client.get_database() # Connect to default DB in URI
+        chats_collection = db['chat_history']
+        # Test command
+        client.admin.command('ping')
+        logger.info("Connected to MongoDB")
         return True
-    except ConnectionFailure:
-        logging.error("MongoDB connection failed.")
+    except Exception as e:
+        logger.error(f"MongoDB Connection Error: {e}")
         return False
 
-def save_block(file_id, page_num, text, bbox):
+def get_chat_history(user_id, limit=10):
+    if chats_collection is None: return []
     try:
-        return db.translation_tasks.update_one(
-            {"file_id": file_id, "bbox": bbox, "page_num": page_num},
-            {"$set": {
-                "original_text": text,
-                "status": "pending",
-                "translated_text": None
-            }},
-            upsert=True
-        )
+        # Retrieve last N messages
+        cursor = chats_collection.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
+        history = list(cursor)
+        return history[::-1] # Reverse to chronological order
     except Exception as e:
-        logging.error(f"Error saving block: {e}")
-
-def save_tasks_bulk(tasks):
-    try:
-        if not tasks:
-            return
-        return db.translation_tasks.insert_many(tasks)
-    except Exception as e:
-        logging.error(f"Error saving tasks bulk: {e}")
-
-def delete_file_tasks(file_id):
-    try:
-        return db.translation_tasks.delete_many({"file_id": file_id})
-    except Exception as e:
-        logging.error(f"Error deleting file tasks: {e}")
-
-def get_next_batch(file_id, limit=10):
-    try:
-        return list(db.translation_tasks.find({"file_id": file_id, "status": "pending"}).limit(limit))
-    except Exception as e:
-        logging.error(f"Error getting batch: {e}")
+        logger.error(f"Error fetching history: {e}")
         return []
 
-def update_task(task_id, translated_text):
-    try:
-        db.translation_tasks.update_one(
-            {"_id": task_id},
-            {"$set": {"translated_text": translated_text, "status": "completed"}}
-        )
-    except Exception as e:
-        logging.error(f"Error updating task: {e}")
+import datetime
 
-def get_completed_count(file_id):
+def add_message(user_id, role, content):
+    if chats_collection is None: return
     try:
-        return db.translation_tasks.count_documents({"file_id": file_id, "status": "completed"})
+        message = {
+            "user_id": user_id,
+            "role": role,
+            "content": content,
+            "timestamp": datetime.datetime.utcnow()
+        }
+        chats_collection.insert_one(message)
     except Exception as e:
-        logging.error(f"Error getting completed count: {e}")
-        return 0
+        logger.error(f"Error adding message: {e}")
 
-def get_total_count(file_id):
+def clear_history(user_id):
+    if chats_collection is None: return
     try:
-        return db.translation_tasks.count_documents({"file_id": file_id})
+        chats_collection.delete_many({"user_id": user_id})
     except Exception as e:
-        logging.error(f"Error getting total count: {e}")
-        return 0
-
-def get_recent_completed(file_id, limit=100):
-    try:
-        return list(db.translation_tasks.find({"file_id": file_id, "status": "completed"}).sort("_id", -1).limit(limit))
-    except Exception as e:
-        logging.error(f"Error getting recent completed: {e}")
-        return []
-
-def get_all_completed(file_id):
-    try:
-        return list(db.translation_tasks.find({"file_id": file_id, "status": "completed"}).sort("page_num", 1))
-    except Exception as e:
-        logging.error(f"Error getting all completed: {e}")
-        return []
+        logger.error(f"Error clearing history: {e}")
