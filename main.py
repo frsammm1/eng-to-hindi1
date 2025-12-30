@@ -3,14 +3,18 @@ import asyncio
 import logging
 import time
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, MessageNotModified
 from config import Config
-from pdf_handler import extract_and_store, rebuild_final_pdf, create_mini_pdf
-from database import get_next_batch, update_task, get_completed_count, get_total_count, check_connection
-from translator import translate_with_retry
+from pdf_handler import extract_and_store, rebuild_final_pdf
+from database import (
+    check_connection, reset_file_tasks, get_pending_tasks,
+    update_task_status, get_task_counts
+)
+from translator import translate_text
 
 # Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -20,7 +24,7 @@ Config.validate()
 
 # Check Database Connection
 if not check_connection():
-    logger.error("Could not connect to MongoDB. Exiting...")
+    logger.error("❌ Critical: MongoDB connection failed. Exiting...")
     exit(1)
 
 app = Client(
@@ -30,149 +34,200 @@ app = Client(
     bot_token=Config.BOT_TOKEN
 )
 
-# Shared state for progress tracking
-class ProgressState:
-    def __init__(self):
-        self.state = "Idle" # Idle, Extracting, Translating, Generating
-        self.total_tasks = 0
-        self.completed_tasks = 0
-        self.is_processing = False
+# --- Process Manager ---
+class ProcessManager:
+    """Manages the lifecycle of a file processing request."""
+    def __init__(self, file_id, chat_id, message_id):
+        self.file_id = file_id
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.start_time = time.time()
+        self.status = "Initializing"
+        self.is_running = True
+        self.semaphore = asyncio.Semaphore(10) # Limit concurrent translations
 
-progress_tracker = {} # file_id -> ProgressState
+    async def run(self, input_path):
+        try:
+            # 1. Extraction
+            self.status = "Extracting Text"
+            logger.info(f"[{self.file_id}] Starting Extraction")
+            reset_file_tasks(self.file_id) # Clean old run
+
+            # Run blocking extraction in thread
+            success = await asyncio.to_thread(extract_and_store, input_path, self.file_id)
+            if not success:
+                raise Exception("Extraction failed")
+
+            # 2. Translation
+            self.status = "Translating"
+            logger.info(f"[{self.file_id}] Starting Translation")
+
+            # Fetch all pending tasks
+            tasks = await asyncio.to_thread(get_pending_tasks, self.file_id)
+            total_tasks = len(tasks)
+            logger.info(f"[{self.file_id}] Found {total_tasks} text blocks to translate")
+
+            # Create async workers
+            # We process in chunks or all at once with semaphore?
+            # Semaphore is better for rate limiting.
+            worker_tasks = [self.process_single_task(t) for t in tasks]
+            if worker_tasks:
+                 await asyncio.gather(*worker_tasks)
+
+            # 3. PDF Rebuild
+            self.status = "Generating PDF"
+            logger.info(f"[{self.file_id}] Rebuilding PDF")
+            output_name = f"HINDI_SSC_{self.file_id[:8]}.pdf"
+            output_path = await asyncio.to_thread(rebuild_final_pdf, self.file_id, input_path, output_name)
+
+            return output_path
+
+        except Exception as e:
+            logger.error(f"[{self.file_id}] Process Error: {e}")
+            self.status = f"Error: {str(e)}"
+            return None
+        finally:
+            self.is_running = False
+
+    async def cleanup(self):
+        """Cleanup resources manually."""
+        pass # Add more cleanup logic if needed
+
+    async def process_single_task(self, task):
+        async with self.semaphore:
+            try:
+                original = task.get('original_text')
+                if not original: return
+
+                # Call async translator
+                hindi = await translate_text(original)
+                if hindi:
+                    # Update DB (non-blocking wrapper)
+                    await asyncio.to_thread(update_task_status, task['_id'], hindi)
+            except Exception as e:
+                logger.error(f"Task error: {e}")
+
+# Global Tracker
+active_processes = {} # file_id -> ProcessManager
+
+async def progress_monitor(client):
+    """Background task to update progress every 12 seconds."""
+    logger.info("Starting Progress Monitor")
+    while True:
+        try:
+            # Iterate over a copy of keys to avoid runtime modification issues
+            current_files = list(active_processes.keys())
+
+            for file_id in current_files:
+                pm = active_processes.get(file_id)
+                if not pm: continue
+
+                # Get DB counts
+                total, completed = await asyncio.to_thread(get_task_counts, file_id)
+
+                percent = 0
+                if total > 0:
+                    percent = (completed / total) * 100
+
+                # Format time
+                elapsed = int(time.time() - pm.start_time)
+
+                text = (
+                    f"⚙️ **Status:** {pm.status}\n"
+                    f"📊 **Progress:** {completed}/{total} ({percent:.1f}%)\n"
+                    f"⏱ **Time Elapsed:** {elapsed}s\n\n"
+                    "Please wait..."
+                )
+
+                # Send Update
+                try:
+                    await client.edit_message_text(pm.chat_id, pm.message_id, text)
+                except MessageNotModified:
+                    pass
+                except FloodWait as e:
+                    logger.warning(f"FloodWait: {e.value}")
+                    # Don't sleep here, just skip this update loop for this user
+                except Exception as e:
+                    logger.warning(f"Update failed for {file_id}: {e}")
+
+                # Avoid overwriting "Complete" message if process finished recently
+                if not pm.is_running and pm.status != "Generating PDF":
+                    # If it's not running and status isn't the last active status, skip update
+                    pass
+
+            await asyncio.sleep(12) # Strict 12s interval
+        except Exception as e:
+            logger.error(f"Monitor Loop Error: {e}")
+            await asyncio.sleep(12)
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     await message.reply(
-        "Welcome to the SSC Translation Bot! 🇮🇳\n\n"
-        "Send me a PDF file (e.g., Previous Year Questions) and I will translate it into Hindi.\n"
-        "I will keep you updated on the progress.\n\n"
-        "**Note:** Please be patient as translation takes time."
+        "👋 **Welcome to the Advanced SSC Translator Bot!**\n\n"
+        "✅ **Features:**\n"
+        "- Asynchronous Processing\n"
+        "- Real-time Progress Updates\n"
+        "- AI-Powered Translation (English -> Hindi)\n\n"
+        "📂 **How to use:**\n"
+        "Simply send me a PDF file to begin."
     )
 
-async def update_progress_message(client, chat_id, message_id, file_id):
-    """Updates the status message every 15 seconds."""
-    last_text = ""
-    while True:
-        if file_id not in progress_tracker:
-            break
-
-        state = progress_tracker[file_id]
-        if not state.is_processing:
-            break
-
-        # Calculate percentage
-        percent = 0
-        if state.total_tasks > 0:
-            percent = (state.completed_tasks / state.total_tasks) * 100
-
-        text = (
-            f"⚙️ **Status:** {state.state}\n"
-            f"📊 **Progress:** {state.completed_tasks}/{state.total_tasks} ({percent:.1f}%)\n"
-            "⏳ Working..."
-        )
-
-        if text != last_text:
-            try:
-                await client.edit_message_text(chat_id, message_id, text)
-                last_text = text
-            except Exception as e:
-                logger.warning(f"Failed to update message: {e}")
-
-        await asyncio.sleep(15)
-
 @app.on_message(filters.document & filters.private)
-async def start_process(client, message):
+async def handle_document(client, message):
     file_id = message.document.file_unique_id
 
-    if file_id in progress_tracker and progress_tracker[file_id].is_processing:
-        await message.reply("⚠️ This file is already being processed.")
+    if file_id in active_processes and active_processes[file_id].is_running:
+        await message.reply("⚠️ This file is already being processed!")
         return
 
-    status_msg = await message.reply("🚀 **Starting Process...**\n\n⬇️ Downloading PDF...")
-    doc_path = await message.download()
-    
-    # Initialize State
-    state = ProgressState()
-    state.is_processing = True
-    state.state = "Extracting Text"
-    progress_tracker[file_id] = state
+    msg = await message.reply("🚀 **Initializing...**")
 
-    # Start Progress Monitor
-    monitor_task = asyncio.create_task(update_progress_message(client, message.chat.id, status_msg.id, file_id))
+    # Start Manager
+    pm = ProcessManager(file_id, message.chat.id, msg.id)
+    active_processes[file_id] = pm
 
     try:
-        # 1. Extraction (Run in thread)
-        logger.info(f"Starting extraction for {file_id}")
-        await asyncio.to_thread(extract_and_store, doc_path, file_id)
-
-        # Update Total Count
-        state.total_tasks = await asyncio.to_thread(get_total_count, file_id)
-        state.state = "Translating"
+        # Download
+        pm.status = "Downloading PDF"
+        doc_path = await message.download()
         
-        # 2. Translation Loop
-        processed_in_session = 0
-        while True:
-            batch = await asyncio.to_thread(get_next_batch, file_id)
-            if not batch:
-                break
-
-            # Update counts from DB to be accurate (or just increment local)
-            state.completed_tasks = await asyncio.to_thread(get_completed_count, file_id)
-            
-            # Process batch
-            for task in batch:
-                hindi = await asyncio.to_thread(translate_with_retry, task['original_text'])
-                if hindi:
-                    await asyncio.to_thread(update_task, task['_id'], hindi)
-                    processed_in_session += 1
-                    state.completed_tasks += 1
-
-            # Mini PDF every 100 questions (Optional, maybe skip to save API/Time)
-            # User asked for improvements, maybe sending mini PDFs is good but slows down.
-            # I will keep it but make it non-blocking
-            if processed_in_session > 0 and processed_in_session % 100 == 0:
-                 mini_name = f"batch_{processed_in_session}_{file_id[:5]}.pdf"
-                 await asyncio.to_thread(create_mini_pdf, file_id, mini_name)
-                 if os.path.exists(mini_name):
-                     try:
-                        await message.reply_document(mini_name, caption=f"✅ {processed_in_session} questions done!")
-                        os.remove(mini_name)
-                     except Exception as e:
-                        logger.error(f"Failed to send mini pdf: {e}")
-
-            # Small sleep not needed if we are in a loop in async handler, but good to yield
-            await asyncio.sleep(0.1)
-
-        # 3. Final PDF
-        state.state = "Generating Final PDF"
-        final_name = f"HINDI_{message.document.file_name}"
-        output_path = await asyncio.to_thread(rebuild_final_pdf, file_id, doc_path, final_name)
+        # Run
+        output_path = await pm.run(doc_path)
         
-        # Stop Monitor
-        state.is_processing = False
-        progress_tracker.pop(file_id, None)
-        await monitor_task # Wait for last update or cancel?
-        # Actually better to cancel monitor and send final update
-        monitor_task.cancel()
-
+        # Result
         if output_path and os.path.exists(output_path):
-            await client.edit_message_text(message.chat.id, status_msg.id, "✅ **Translation Complete!** Sending file...")
-            await message.reply_document(output_path, caption="Jai Hind! 🇮🇳 Poori book Hindi mein tayyar hai.")
-            os.remove(output_path)
+            # Final Status Update - Mark as done so monitor doesn't overwrite
+            pm.is_running = False
+
+            await client.edit_message_text(message.chat.id, msg.id, "✅ **Translation Complete!** Uploading...")
+            await message.reply_document(
+                output_path,
+                caption=f"🎉 **Translated File:** {message.document.file_name}\nPowered by SSC Bot"
+            )
         else:
-            await client.edit_message_text(message.chat.id, status_msg.id, "❌ **Error:** Failed to generate final PDF.")
+            await client.edit_message_text(message.chat.id, msg.id, f"❌ **Failed:** {pm.status}")
 
     except Exception as e:
-        logger.error(f"Error in process: {e}")
-        state.is_processing = False
-        progress_tracker.pop(file_id, None)
-        monitor_task.cancel()
-        await client.edit_message_text(message.chat.id, status_msg.id, f"❌ **Error:** {str(e)}")
-
+        logger.error(f"Handler Error: {e}")
+        await client.edit_message_text(message.chat.id, msg.id, f"❌ **Error:** {str(e)}")
     finally:
-        if os.path.exists(doc_path):
+        # Cleanup
+        if 'doc_path' in locals() and os.path.exists(doc_path):
             os.remove(doc_path)
+        if 'output_path' in locals() and output_path and os.path.exists(output_path):
+            os.remove(output_path)
+
+        active_processes.pop(file_id, None)
 
 if __name__ == "__main__":
-    logger.info("Bot Started...")
+    logger.info("Bot Starting...")
+    # Start the monitor loop
+    # Since app.run() blocks, we need to schedule the monitor before,
+    # OR use app.start(), monitor(), app.stop() manually?
+    # Pyrogram app.run() is convenient. We can add the monitor as a task in `start` callback?
+    # Or just use `loop.create_task` before `app.run()`.
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(progress_monitor(app))
+
     app.run()
