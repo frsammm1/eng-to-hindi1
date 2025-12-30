@@ -1,62 +1,47 @@
-# Telegram Smart Cloner (Userbot)
-**A powerful Userbot to clone content from ANY channel (Private/Public) to your own.**
+# Telegram Smart Cloner (Chat-Based)
+**A Dual-Mode bot where you chat with the Bot to control the Userbot.**
 
-## Features
-- **Userbot Mode Only:** Runs on your account, giving it access to everything you see.
-- **Smart Parsing:** Auto-detects Chat IDs and Message IDs from links (Private, Public, Topics).
-- **Clone Wizard:** Simple `/clone` command walks you through setup.
-- **High Speed:** Tracks Speed (MB/s), ETA, and Progress.
-- **Content Fidelity:** Copies files, media, captions exactly as they are.
+## Architecture
+1.  **Bot Interface:** You talk to `@YourBot` to send commands.
+2.  **Userbot Worker:** The bot logs into your account (Userbot) to copy content from private/restricted channels.
 
 ## Setup
-
-1.  **Clone & Install:**
+1.  **Deploy:**
     ```bash
-    git clone <repo_url>
+    git clone <repo>
     pip install -r requirements.txt
     ```
-
-2.  **Config:**
-    Create a `.env` file:
+2.  **Config (`.env`):**
     ```
-    API_ID=123456
+    API_ID=12345
     API_HASH=abcdef...
+    BOT_TOKEN=123456:ABC-DEF...
     MONGO_URI=mongodb+srv://...
     ```
-    *(Note: No BOT_TOKEN needed)*
 
-3.  **Run & Login:**
+3.  **Run:**
     ```bash
     python main.py
     ```
-    - Enter Phone Number & OTP when prompted.
-    - Session saved to `my_userbot.session`.
 
-## Usage
+## How to Login (First Time)
+1.  Start your bot in Telegram: `/start`.
+    > It will say "Userbot Status: 🔴 Offline".
+2.  Send `/login`.
+3.  Enter your **Phone Number** (e.g., `+919999999999`).
+4.  Enter the **OTP** code sent to your Telegram.
+5.  (Optional) Enter **2FA Password** if enabled.
+6.  The bot will confirm: "Userbot Active".
 
-**1. Start the Wizard:**
-Send `/clone` to **Saved Messages** (or any chat).
-
-**2. Provide First Link:**
-Copy the link of the **First Message** from the source channel (Private or Public) and send it.
-> *Example: `https://t.me/c/1234567890/100`*
-
-**3. Provide Last Link:**
-Copy the link of the **Last Message** and send it.
-
-**4. Provide Destination ID:**
-Send the Chat ID of your target channel (e.g., `-100987654321`).
-> *Tip: Use the `/id` command inside your target channel to get its ID.*
-
-**5. Start:**
-Type `start` to begin the transfer.
+## How to Clone
+1.  Send `/clone`.
+2.  **Start Link:** Send the link of the first message to copy (e.g., `https://t.me/c/123/100`).
+3.  **End Link:** Send the link of the last message.
+4.  **Destination ID:** Send the Chat ID (e.g., `-100987...`).
+5.  Type `start`.
 
 ## Commands
-- `/clone` - Start setup.
-- `/cancel` - Stop current job or setup.
-- `/status` - View live progress (Speed, ETA).
-- `/id` - Get current chat ID.
-
-## Notes
-- **Private Channels:** Since this is a Userbot, if YOU can see the channel, the Bot can copy from it.
-- **Permissions:** You must have permission to post in the Destination Channel.
+- `/login` - Log in to your User account via the Bot.
+- `/clone` - Start a new copy job.
+- `/cancel` - Stop jobs or setup.
+- `/status` - Check progress (Speed, ETA).
