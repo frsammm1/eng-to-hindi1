@@ -7,8 +7,9 @@ from database import update_job_progress, complete_job, get_active_job
 logger = logging.getLogger(__name__)
 
 class TransferEngine:
-    def __init__(self, client: Client):
-        self.client = client # Userbot client for everything
+    def __init__(self, bot: Client, userbot: Client):
+        self.bot = bot         # Bot client for UI/Status updates
+        self.userbot = userbot # Userbot client for Copying
         self.active_tasks = {}
 
     async def start_transfer(self, job):
@@ -33,6 +34,7 @@ class TransferEngine:
         start_id = job['current_id']
         end_id = job['end_id']
         job_id = job['_id']
+        user_id = job['user_id']
 
         logger.info(f"Starting transfer job {job_id}: {source} -> {dest} ({start_id}-{end_id})")
 
@@ -46,14 +48,14 @@ class TransferEngine:
         last_update_time = 0
         status_msg = None
 
-        # Initial Status
+        # Initial Status via Bot
         try:
-            status_msg = await self.client.send_message(
-                "me", # Send to Saved Messages as it acts as log
-                f"🚀 **Transfer Started**\n\nSource: `{source}`\nDest: `{dest}`\nRange: `{start_id}` - `{end_id}`"
+            status_msg = await self.bot.send_message(
+                chat_id=user_id,
+                text=f"🚀 **Transfer Started**\n\nSource: `{source}`\nDest: `{dest}`\nRange: `{start_id}` - `{end_id}`"
             )
         except Exception as e:
-            logger.error(f"Could not send status message: {e}")
+            logger.error(f"Could not send status message to user {user_id}: {e}")
 
         try:
             for msg_id in range(start_id, end_id + 1):
@@ -62,47 +64,46 @@ class TransferEngine:
                     logger.info("Job cancelled via DB check.")
                     break
 
-                try:
-                    # Copy Message
-                    msg = await self.client.copy_message(
-                        chat_id=dest,
-                        from_chat_id=source,
-                        message_id=msg_id
-                    )
-
-                    # Track size if media/file
-                    if msg:
-                        if msg.document: total_bytes += msg.document.file_size
-                        elif msg.video: total_bytes += msg.video.file_size
-                        elif msg.photo: total_bytes += msg.photo.file_size
-                        elif msg.audio: total_bytes += msg.audio.file_size
-
-                    success = True
-                    await asyncio.sleep(0.5)
-
-                except errors.FloodWait as e:
-                    logger.warning(f"FloodWait: Sleeping {e.value} seconds...")
-                    if status_msg:
-                        await status_msg.edit(f"⚠️ FloodWait hit. Sleeping for {e.value}s...")
-                    await asyncio.sleep(e.value)
-                    # Retry
+                # Copy Message with Retry Loop
+                while True:
                     try:
-                        await self.client.copy_message(
+                        msg = await self.userbot.copy_message(
                             chat_id=dest,
                             from_chat_id=source,
                             message_id=msg_id
                         )
-                        success = True
-                    except Exception:
-                        success = False
 
-                except errors.MessageEmpty:
-                    success = False
-                except errors.MessageIdInvalid:
-                    success = False
-                except Exception as e:
-                    logger.error(f"Error copying {msg_id}: {e}")
-                    success = False
+                        # Track size if media/file
+                        if msg:
+                            if msg.document: total_bytes += msg.document.file_size
+                            elif msg.video: total_bytes += msg.video.file_size
+                            elif msg.photo: total_bytes += msg.photo.file_size
+                            elif msg.audio: total_bytes += msg.audio.file_size
+
+                        success = True
+                        await asyncio.sleep(0.5) # Rate limit courtesy
+                        break # Success, exit retry loop
+
+                    except errors.FloodWait as e:
+                        logger.warning(f"FloodWait: Sleeping {e.value} seconds...")
+                        if status_msg:
+                            try:
+                                await status_msg.edit(f"⚠️ FloodWait hit. Sleeping for {e.value}s...")
+                            except Exception:
+                                pass
+                        await asyncio.sleep(e.value)
+                        # Loop continues to retry
+
+                    except errors.MessageEmpty:
+                        success = False
+                        break # Cannot retry empty message
+                    except errors.MessageIdInvalid:
+                        success = False
+                        break # Cannot retry invalid ID
+                    except Exception as e:
+                        logger.error(f"Error copying {msg_id}: {e}")
+                        success = False
+                        break # Unknown error, skip to next message
 
                 update_job_progress(job_id, msg_id, success)
                 processed += 1
