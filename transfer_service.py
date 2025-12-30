@@ -7,9 +7,10 @@ from database import update_job_progress, complete_job, get_active_job
 logger = logging.getLogger(__name__)
 
 class TransferEngine:
-    def __init__(self, client: Client):
-        self.client = client
-        self.active_tasks = {} # Map user_id to asyncio.Task
+    def __init__(self, bot_client: Client, user_client: Client):
+        self.bot = bot_client   # For status updates
+        self.user = user_client # For copying messages (access)
+        self.active_tasks = {}  # Map user_id to asyncio.Task
 
     async def start_transfer(self, job):
         user_id = job['user_id']
@@ -45,9 +46,9 @@ class TransferEngine:
         last_update_time = 0
         status_msg = None
 
-        # Try to send an initial status message
+        # Try to send an initial status message via BOT
         try:
-            status_msg = await self.client.send_message(
+            status_msg = await self.bot.send_message(
                 job['user_id'],
                 f"🚀 **Transfer Started**\n\nSource: `{source}`\nDest: `{dest}`\nRange: `{start_id}` - `{end_id}`"
             )
@@ -56,32 +57,29 @@ class TransferEngine:
 
         try:
             for msg_id in range(start_id, end_id + 1):
-                # Check if cancelled externally (though task cancellation should handle this)
+                # Check if cancelled externally
                 current_job_status = get_active_job(job['user_id'])
                 if not current_job_status:
                     logger.info("Job cancelled via DB check.")
                     break
 
                 try:
-                    # The Core Logic: Copy Message
-                    # We iterate one by one as requested.
-                    # Note: We use copy_message for "Any" type.
-                    await self.client.copy_message(
+                    # The Core Logic: Copy Message via USERBOT
+                    await self.user.copy_message(
                         chat_id=dest,
                         from_chat_id=source,
                         message_id=msg_id
                     )
                     success = True
-                    # Small delay to prevent generic flood
                     await asyncio.sleep(0.5)
 
                 except errors.FloodWait as e:
                     logger.warning(f"FloodWait: Sleeping {e.value} seconds...")
-                    await self.client.send_message(job['user_id'], f"⚠️ FloodWait hit. Sleeping for {e.value}s...")
+                    await self.bot.send_message(job['user_id'], f"⚠️ FloodWait hit. Sleeping for {e.value}s...")
                     await asyncio.sleep(e.value)
-                    # Retry the same message
+                    # Retry
                     try:
-                        await self.client.copy_message(
+                        await self.user.copy_message(
                             chat_id=dest,
                             from_chat_id=source,
                             message_id=msg_id

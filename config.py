@@ -17,7 +17,7 @@ class Config:
         missing = []
         if not cls.API_ID: missing.append("API_ID")
         if not cls.API_HASH: missing.append("API_HASH")
-        # We allow BOT_TOKEN and SESSION_STRING to be empty for interactive login
+        if not cls.BOT_TOKEN: missing.append("BOT_TOKEN")
         if not cls.MONGO_URI: missing.append("MONGO_URI")
 
         if missing:

@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from config import Config
 from database import check_connection, create_job, cancel_job, get_active_job
 from transfer_service import TransferEngine
@@ -20,57 +20,47 @@ if not check_connection():
     logger.error("Could not connect to MongoDB. Exiting...")
     exit(1)
 
-# Initialize Client
-# Logic:
-# 1. If BOT_TOKEN is present -> Start as Bot
-# 2. If SESSION_STRING is present -> Start as Userbot (Memory)
-# 3. Else -> Start as Userbot (File/Interactive Login)
-if Config.BOT_TOKEN:
-    logger.info("Starting in BOT mode (Bot Token provided).")
-    app = Client(
-        "ssc_transfer_bot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        bot_token=Config.BOT_TOKEN
-    )
-elif Config.SESSION_STRING:
-    logger.info("Starting in USERBOT mode (Session String provided).")
-    app = Client(
-        "ssc_transfer_userbot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        session_string=Config.SESSION_STRING
-    )
-else:
-    logger.info("Starting in USERBOT mode (Interactive Login).")
-    # This will check for 'my_userbot.session'.
-    # If not found, it triggers CLI login.
-    app = Client(
-        "my_userbot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH
-    )
+# --- Initialize Clients ---
 
-# Initialize Transfer Engine
-engine = TransferEngine(app)
+# 1. Bot Client (Interface)
+bot = Client(
+    "ssc_transfer_bot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN
+)
 
-@app.on_message(filters.command("start"))
+# 2. User Client (Worker)
+# This will trigger interactive login if 'my_userbot.session' is missing
+userbot = Client(
+    "my_userbot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH
+)
+
+# Initialize Engine with BOTH clients
+engine = TransferEngine(bot_client=bot, user_client=userbot)
+
+# --- Bot Commands ---
+
+@bot.on_message(filters.command("start"))
 async def start_command(client, message):
     text = (
         "🚀 **Telegram Content Transfer Bot**\n\n"
-        "I can copy messages from one channel to another, one by one.\n"
-        "I handle all file types, media, and text.\n\n"
+        "I am the Control Interface. The **Userbot** (Worker) will handle the actual copying.\n\n"
+        "**Features:**\n"
+        "• Copy from Private Channels (Userbot access)\n"
+        "• Preserve Files, Media, Text\n"
+        "• Range Selection\n\n"
         "**Commands:**\n"
-        "`/batch <source> <dest> <start_id> <end_id>` - Start a transfer job.\n"
-        "`/cancel` - Stop the current job.\n"
-        "`/status` - Check current status.\n\n"
-        "**Example:**\n"
-        "`/batch -1001234567890 -1009876543210 100 500`\n\n"
-        "**Note:** Ensure I am a member (or admin) in the source and destination channels."
+        "`/batch <source> <dest> <start_id> <end_id>`\n"
+        "`/cancel`\n"
+        "`/status`\n\n"
+        "**Note:** Use channel IDs (e.g., `-100xxxx`). Ensure the Userbot account has joined the source."
     )
     await message.reply(text)
 
-@app.on_message(filters.command("batch"))
+@bot.on_message(filters.command("batch"))
 async def batch_command(client, message):
     # Check permissions
     if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
@@ -126,7 +116,7 @@ async def batch_command(client, message):
         logger.error(f"Error starting batch: {e}")
         await message.reply(f"❌ Error starting transfer: {e}")
 
-@app.on_message(filters.command("cancel"))
+@bot.on_message(filters.command("cancel"))
 async def cancel_command(client, message):
     if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
         return
@@ -144,7 +134,7 @@ async def cancel_command(client, message):
     else:
         await message.reply("⚠️ No active job found to cancel.")
 
-@app.on_message(filters.command("status"))
+@bot.on_message(filters.command("status"))
 async def status_command(client, message):
     job = get_active_job(message.from_user.id)
     if not job:
@@ -160,6 +150,24 @@ async def status_command(client, message):
         f"Failed: `{job['failed']}`"
     )
 
+async def main():
+    logger.info("Starting Bot Client...")
+    await bot.start()
+
+    logger.info("Starting Userbot Client (CLI Login may be required)...")
+    await userbot.start()
+
+    me = await userbot.get_me()
+    logger.info(f"Userbot Started as: {me.first_name} (ID: {me.id})")
+
+    bot_info = await bot.get_me()
+    logger.info(f"Bot Started as: @{bot_info.username}")
+
+    logger.info("Service is Ready. Idling...")
+    await idle()
+
+    await bot.stop()
+    await userbot.stop()
+
 if __name__ == "__main__":
-    logger.info("Transfer Bot Service Started...")
-    app.run()
+    asyncio.get_event_loop().run_until_complete(main())
