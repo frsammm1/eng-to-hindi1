@@ -1,15 +1,15 @@
-import time
+import asyncio
 import logging
-from groq import Groq
+from groq import AsyncGroq
 from config import Config
 
 try:
-    groq_client = Groq(api_key=Config.GROQ_API_KEY)
+    groq_client = AsyncGroq(api_key=Config.GROQ_API_KEY)
 except Exception as e:
     logging.error(f"Failed to initialize Groq client: {e}")
     groq_client = None
 
-def translate_with_retry(text, retries=5):
+async def translate_text(text, retries=5):
     if not groq_client:
         logging.error("Groq client not initialized")
         return None
@@ -17,7 +17,7 @@ def translate_with_retry(text, retries=5):
     attempt = 0
     while attempt < retries:
         try:
-            chat_completion = groq_client.chat.completions.create(
+            chat_completion = await groq_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": "You are an SSC GS Expert. Translate the following English text to Hindi. Preserve technical terms. Output ONLY the translated text."},
                     {"role": "user", "content": text}
@@ -31,7 +31,7 @@ def translate_with_retry(text, retries=5):
             if "429" in error_msg: # Rate Limit
                 wait_time = (attempt + 1) * 20 # Progressive backoff: 20, 40, 60...
                 logging.warning(f"Rate limit exceeded. Waiting {wait_time}s. Attempt {attempt+1}/{retries}")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
                 attempt += 1
             else:
                 logging.error(f"Translation error: {e}")

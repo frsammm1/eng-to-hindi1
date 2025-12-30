@@ -1,16 +1,39 @@
 import fitz
 import logging
-from database import save_block, get_recent_completed, get_all_completed
+from database import save_tasks_bulk, get_recent_completed, get_all_completed
 
 def extract_and_store(pdf_path, file_id):
     try:
         doc = fitz.open(pdf_path)
+        batch = []
+        batch_size = 1000  # Insert every 1000 blocks to save memory
+
         for page_num, page in enumerate(doc):
             blocks = page.get_text("blocks")
             for b in blocks:
                 text = b[4].strip()
                 if text:
-                    save_block(file_id, page_num, text, list(b[:4]))
+                    task = {
+                        "file_id": file_id,
+                        "page_num": page_num,
+                        "bbox": list(b[:4]),
+                        "original_text": text,
+                        "status": "pending",
+                        "translated_text": None
+                    }
+                    batch.append(task)
+
+            # Flush batch if large enough
+            if len(batch) >= batch_size:
+                save_tasks_bulk(batch)
+                batch = []
+                logging.info(f"Saved batch of tasks for page {page_num}")
+
+        # Save remaining
+        if batch:
+            save_tasks_bulk(batch)
+            logging.info(f"Saved final batch of tasks for {file_id}")
+
         doc.close()
     except Exception as e:
         logging.error(f"Error extracting PDF: {e}")

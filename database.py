@@ -30,6 +30,20 @@ def save_block(file_id, page_num, text, bbox):
     except Exception as e:
         logging.error(f"Error saving block: {e}")
 
+def save_tasks_bulk(tasks):
+    try:
+        if not tasks:
+            return
+        return db.translation_tasks.insert_many(tasks)
+    except Exception as e:
+        logging.error(f"Error saving tasks bulk: {e}")
+
+def delete_file_tasks(file_id):
+    try:
+        return db.translation_tasks.delete_many({"file_id": file_id})
+    except Exception as e:
+        logging.error(f"Error deleting file tasks: {e}")
+
 def get_next_batch(file_id, limit=10):
     try:
         return list(db.translation_tasks.find({"file_id": file_id, "status": "pending"}).limit(limit))

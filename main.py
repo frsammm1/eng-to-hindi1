@@ -5,8 +5,8 @@ import time
 from pyrogram import Client, filters
 from config import Config
 from pdf_handler import extract_and_store, rebuild_final_pdf, create_mini_pdf
-from database import get_next_batch, update_task, get_completed_count, get_total_count, check_connection
-from translator import translate_with_retry
+from database import get_next_batch, update_task, get_completed_count, get_total_count, check_connection, delete_file_tasks
+from translator import translate_text
 
 # Configure logging
 logging.basicConfig(
@@ -48,6 +48,15 @@ async def start_command(client, message):
         "I will keep you updated on the progress.\n\n"
         "**Note:** Please be patient as translation takes time."
     )
+
+async def send_mini_pdf(client, message, file_id, mini_name):
+    try:
+        await asyncio.to_thread(create_mini_pdf, file_id, mini_name)
+        if os.path.exists(mini_name):
+            await message.reply_document(mini_name, caption=f"✅ Progress update!")
+            os.remove(mini_name)
+    except Exception as e:
+        logger.error(f"Failed to send mini pdf: {e}")
 
 async def update_progress_message(client, chat_id, message_id, file_id):
     """Updates the status message every 15 seconds."""
@@ -101,6 +110,9 @@ async def start_process(client, message):
     monitor_task = asyncio.create_task(update_progress_message(client, message.chat.id, status_msg.id, file_id))
 
     try:
+        # 0. Cleanup old tasks
+        await asyncio.to_thread(delete_file_tasks, file_id)
+
         # 1. Extraction (Run in thread)
         logger.info(f"Starting extraction for {file_id}")
         await asyncio.to_thread(extract_and_store, doc_path, file_id)
@@ -109,38 +121,39 @@ async def start_process(client, message):
         state.total_tasks = await asyncio.to_thread(get_total_count, file_id)
         state.state = "Translating"
         
-        # 2. Translation Loop
+        # 2. Translation Loop (Concurrent)
         processed_in_session = 0
+        semaphore = asyncio.Semaphore(10) # Limit concurrent API calls to 10
+
+        async def process_task(task):
+            nonlocal processed_in_session
+            async with semaphore:
+                hindi = await translate_text(task['original_text'])
+                if hindi:
+                    await asyncio.to_thread(update_task, task['_id'], hindi)
+                    state.completed_tasks += 1
+                    return True
+                return False
+
         while True:
-            batch = await asyncio.to_thread(get_next_batch, file_id)
+            # Fetch larger batch for concurrency
+            batch = await asyncio.to_thread(get_next_batch, file_id, limit=50)
             if not batch:
                 break
 
-            # Update counts from DB to be accurate (or just increment local)
-            state.completed_tasks = await asyncio.to_thread(get_completed_count, file_id)
+            # Process batch concurrently
+            results = await asyncio.gather(*[process_task(task) for task in batch])
+            processed_in_session += sum(1 for r in results if r)
             
-            # Process batch
-            for task in batch:
-                hindi = await asyncio.to_thread(translate_with_retry, task['original_text'])
-                if hindi:
-                    await asyncio.to_thread(update_task, task['_id'], hindi)
-                    processed_in_session += 1
-                    state.completed_tasks += 1
+            # Update counts from DB strictly occasionally
+            if processed_in_session % 50 == 0:
+                 state.completed_tasks = await asyncio.to_thread(get_completed_count, file_id)
 
-            # Mini PDF every 100 questions (Optional, maybe skip to save API/Time)
-            # User asked for improvements, maybe sending mini PDFs is good but slows down.
-            # I will keep it but make it non-blocking
-            if processed_in_session > 0 and processed_in_session % 100 == 0:
+            # Mini PDF every 200 questions
+            if processed_in_session > 0 and processed_in_session % 200 == 0:
                  mini_name = f"batch_{processed_in_session}_{file_id[:5]}.pdf"
-                 await asyncio.to_thread(create_mini_pdf, file_id, mini_name)
-                 if os.path.exists(mini_name):
-                     try:
-                        await message.reply_document(mini_name, caption=f"✅ {processed_in_session} questions done!")
-                        os.remove(mini_name)
-                     except Exception as e:
-                        logger.error(f"Failed to send mini pdf: {e}")
+                 asyncio.create_task(send_mini_pdf(client, message, file_id, mini_name)) # Fire and forget
 
-            # Small sleep not needed if we are in a loop in async handler, but good to yield
             await asyncio.sleep(0.1)
 
         # 3. Final PDF
