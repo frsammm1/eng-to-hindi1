@@ -36,9 +36,12 @@ async def start_command(client, message):
     clear_history(user_id)
 
     welcome_text = (
-        "Hey baby! 😘\n"
-        "I'm Riya, your personal AI girlfriend. I'm here to chat, have fun, and maybe send you some cute pics.\n\n"
-        "Just talk to me normally, or use `/image [description]` if you want to see something specific. 😉"
+        "Hello! I am your Advanced AI Assistant. 🤖\n"
+        "I can help you with questions, research topics online, and even generate images.\n\n"
+        "• Chat with me in English or Hindi (Hinglish).\n"
+        "• Ask me about current events (I can search the web! 🌐).\n"
+        "• Use `/image [description]` to generate AI art.\n\n"
+        "How can I assist you today?"
     )
     add_message(user_id, "assistant", welcome_text)
     await message.reply(welcome_text)
@@ -46,24 +49,24 @@ async def start_command(client, message):
 @app.on_message(filters.command("reset"))
 async def reset_command(client, message):
     clear_history(message.from_user.id)
-    await message.reply("Memory wiped! Let's start over, handsome. 😉")
+    await message.reply("Memory wiped! Starting a fresh session. 🔄")
 
 @app.on_message(filters.command("image"))
 async def image_command(client, message):
     if len(message.command) < 2:
-        await message.reply("Tell me what you want to see, babe! Example: `/image sunset on the beach`")
+        await message.reply("Please provide a description! Example: `/image futuristic city at night`")
         return
 
     prompt = message.text.split(None, 1)[1]
-    status_msg = await message.reply("Sending you a pic... hold on! 📸")
+    status_msg = await message.reply("Generating image... please wait. 🎨")
     
     try:
         image_url = await generate_image(prompt)
         if image_url:
-            await message.reply_photo(image_url, caption=f"Here is '{prompt}' for you! 😘")
+            await message.reply_photo(image_url, caption=f"Generated: '{prompt}'")
             await status_msg.delete()
         else:
-            await status_msg.edit("Oops, I couldn't take that picture right now. Try again? 🥺")
+            await status_msg.edit("Failed to generate image. Please try again.")
     except Exception as e:
         logger.error(f"Image command error: {e}")
         await status_msg.edit("Something went wrong, sorry!")
@@ -73,51 +76,6 @@ async def chat_handler(client, message):
     user_id = message.from_user.id
     user_input = message.text
 
-    # Implicitly detect if user wants an image (Hinglish support)
-    lower_msg = user_input.lower()
-    image_triggers = ["pic", "photo", "image", "selfie", "nudes", "snap"]
-    send_triggers = ["send", "give", "bhej", "dikha", "show", "le"]
-
-    # Check intersection
-    wants_image = any(t in lower_msg for t in image_triggers) and any(s in lower_msg for s in send_triggers)
-
-    if wants_image:
-        # Sanitize "nude" requests
-        if "nude" in lower_msg or "naked" in lower_msg:
-             await message.reply("Baby, I keep it classy here! 😉 Ask me for something else.")
-             return
-
-        # Clean up the prompt to remove triggers
-        all_triggers = image_triggers + send_triggers + ["me", "a", "of", "ko", "mujhe", "ek"]
-        pattern = r'\b(' + '|'.join(map(re.escape, all_triggers)) + r')\b'
-        clean_prompt = re.sub(pattern, '', lower_msg, flags=re.IGNORECASE).strip()
-
-        # If the clean prompt is empty or just whitespace, fallback
-        if not clean_prompt or len(clean_prompt) < 2:
-            clean_prompt = "beautiful girl selfie" # Default fallback
-
-        prompt = clean_prompt
-
-        # Notify user (Simulate AI response before action)
-        status_msg = await message.reply("Sending it right now, babe! 😘")
-        await client.send_chat_action(message.chat.id, pyrogram.enums.ChatAction.UPLOAD_PHOTO)
-
-        try:
-            image_url = await generate_image(prompt)
-            if image_url:
-                await message.reply_photo(image_url, caption=f"Here's your '{prompt}'! ❤️")
-                await status_msg.delete()
-                # Record this interaction in history so context is maintained
-                add_message(user_id, "user", user_input)
-                add_message(user_id, "assistant", f"[Sent a photo of {prompt}]")
-                return # Stop processing text response
-            else:
-                await status_msg.edit("Oops, my camera acted up. Ask me again? 🥺")
-                return
-        except Exception as e:
-            logger.error(f"Implicit image generation error: {e}")
-            await status_msg.edit("Sorry, something went wrong!")
-            return
 
     # 1. Get History (before adding current message to avoid duplication in context)
     history = get_chat_history(user_id, limit=10)
@@ -136,5 +94,5 @@ async def chat_handler(client, message):
     await message.reply(response_text)
 
 if __name__ == "__main__":
-    logger.info("Riya AI Started...")
+    logger.info("Advanced AI Assistant Started...")
     app.run()

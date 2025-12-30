@@ -2,8 +2,10 @@ import logging
 import random
 import aiohttp
 import urllib.parse
+import asyncio
 from groq import AsyncGroq
 from config import Config
+from duckduckgo_search import DDGS
 
 logger = logging.getLogger(__name__)
 
@@ -13,16 +15,35 @@ except Exception as e:
     logger.error(f"Failed to initialize Groq client: {e}")
     groq_client = None
 
+async def perform_search(query):
+    """Performs a web search using DuckDuckGo."""
+    try:
+        # Running synchronous DDGS in a thread executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, lambda: list(DDGS().text(query, max_results=3)))
+
+        if not results:
+            return "No search results found."
+
+        summary = ""
+        for r in results:
+            summary += f"- Title: {r.get('title')}\n  Link: {r.get('href')}\n  Snippet: {r.get('body')}\n\n"
+        return summary
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Error during search: {str(e)}"
+
 async def get_chat_response(history_messages, user_input):
     """
-    Generates a chat response using Groq.
+    Generates a chat response using Groq, with support for Research.
     history_messages: List of dicts {'role': 'user'/'assistant', 'content': '...'}
     """
     if not groq_client:
-        return "Sorry, my brain is offline right now! 😵‍💫"
+        return "System Error: AI Brain Offline."
 
     messages = [{"role": "system", "content": Config.SYSTEM_PROMPT}]
-    # Append history (limit context window if needed, done in db fetch)
+
+    # Append history
     for msg in history_messages:
         role = "assistant" if msg['role'] == "assistant" else "user"
         messages.append({"role": role, "content": msg['content']})
@@ -31,16 +52,46 @@ async def get_chat_response(history_messages, user_input):
     messages.append({"role": "user", "content": user_input})
 
     try:
+        # First Pass: Check if search is needed
+        # We lower temperature for accurate tool use decision
         completion = await groq_client.chat.completions.create(
             messages=messages,
             model=Config.GROQ_MODEL_NAME,
-            temperature=0.8, # Higher temperature for more creative/flirty responses
-            max_tokens=250,
+            temperature=0.3,
+            max_tokens=300,
         )
-        return completion.choices[0].message.content
+        response_text = completion.choices[0].message.content
+
+        # Check for SEARCH command
+        if "SEARCH:" in response_text:
+            # Extract query
+            import re
+            match = re.search(r"SEARCH:\s*(.*)", response_text)
+            if match:
+                query = match.group(1).strip()
+                logger.info(f"AI requested search for: {query}")
+
+                # Perform Search
+                search_results = await perform_search(query)
+
+                # Feed results back to AI
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "system", "content": f"SEARCH RESULTS:\n{search_results}\n\nUsing these results, answer the user's question."})
+
+                # Second Pass: Generate final answer
+                final_completion = await groq_client.chat.completions.create(
+                    messages=messages,
+                    model=Config.GROQ_MODEL_NAME,
+                    temperature=0.7,
+                    max_tokens=800,
+                )
+                return final_completion.choices[0].message.content
+
+        return response_text
+
     except Exception as e:
         logger.error(f"Groq API Error: {e}")
-        return "Baby, I'm having a bit of a headache... can you say that again? 🥺"
+        return "I encountered an error processing your request. Please try again."
 
 async def generate_image(prompt):
     """
