@@ -29,6 +29,32 @@ app = Client(
     bot_token=Config.BOT_TOKEN
 )
 
+async def send_chunked_message(message, text):
+    """Splits long text into chunks to respect Telegram's limit."""
+    limit = 4096
+    if len(text) <= limit:
+        await message.reply(text)
+        return
+
+    parts = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+
+        # Find split point
+        split_at = text.rfind('\n', 0, limit)
+        if split_at == -1:
+            split_at = text.rfind(' ', 0, limit)
+        if split_at == -1:
+            split_at = limit
+
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip()
+
+    for part in parts:
+        await message.reply(part)
+
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     user_id = message.from_user.id
@@ -91,7 +117,7 @@ async def chat_handler(client, message):
 
     # 4. Save & Send Response
     add_message(user_id, "assistant", response_text)
-    await message.reply(response_text)
+    await send_chunked_message(message, response_text)
 
 if __name__ == "__main__":
     logger.info("Advanced AI Assistant Started...")

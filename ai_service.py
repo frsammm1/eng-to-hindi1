@@ -83,7 +83,7 @@ async def get_chat_response(history_messages, user_input):
                     messages=messages,
                     model=Config.GROQ_MODEL_NAME,
                     temperature=0.7,
-                    max_tokens=800,
+                    max_tokens=2500,
                 )
                 return final_completion.choices[0].message.content
 
