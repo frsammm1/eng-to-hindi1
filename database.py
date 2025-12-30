@@ -7,20 +7,18 @@ logger = logging.getLogger(__name__)
 
 client = None
 db = None
-chats_collection = None
+jobs_collection = None
 
 def check_connection():
-    global client, db, chats_collection
+    global client, db, jobs_collection
     try:
         client = MongoClient(Config.MONGO_URI)
         try:
-            db = client.get_database() # Connect to default DB in URI
+            db = client.get_database()
         except Exception:
-            # Fallback if no default database is defined in URI
-            db = client['riya_bot']
+            db = client['transfer_bot']
 
-        chats_collection = db['chat_history']
-        # Test command
+        jobs_collection = db['transfer_jobs']
         client.admin.command('ping')
         logger.info("Connected to MongoDB")
         return True
@@ -28,33 +26,60 @@ def check_connection():
         logger.error(f"MongoDB Connection Error: {e}")
         return False
 
-def get_chat_history(user_id, limit=10):
-    if chats_collection is None: return []
-    try:
-        # Retrieve last N messages
-        cursor = chats_collection.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
-        history = list(cursor)
-        return history[::-1] # Reverse to chronological order
-    except Exception as e:
-        logger.error(f"Error fetching history: {e}")
-        return []
+def create_job(user_id, source, dest, start_id, end_id):
+    """Creates a new transfer job."""
+    if jobs_collection is None: return None
+    job = {
+        "user_id": user_id,
+        "source": source,
+        "dest": dest,
+        "start_id": int(start_id),
+        "end_id": int(end_id),
+        "current_id": int(start_id),
+        "status": "active", # active, cancelled, completed, failed
+        "total_count": int(end_id) - int(start_id) + 1,
+        "processed": 0,
+        "failed": 0,
+        "start_time": datetime.datetime.utcnow(),
+        "last_updated": datetime.datetime.utcnow()
+    }
+    result = jobs_collection.insert_one(job)
+    return str(result.inserted_id)
 
-def add_message(user_id, role, content):
-    if chats_collection is None: return
-    try:
-        message = {
-            "user_id": user_id,
-            "role": role,
-            "content": content,
-            "timestamp": datetime.datetime.utcnow()
-        }
-        chats_collection.insert_one(message)
-    except Exception as e:
-        logger.error(f"Error adding message: {e}")
+def get_active_job(user_id):
+    """Gets the currently active job for a user."""
+    if jobs_collection is None: return None
+    return jobs_collection.find_one({"user_id": user_id, "status": "active"})
 
-def clear_history(user_id):
-    if chats_collection is None: return
-    try:
-        chats_collection.delete_many({"user_id": user_id})
-    except Exception as e:
-        logger.error(f"Error clearing history: {e}")
+def update_job_progress(job_id, current_id, success=True):
+    """Updates the progress of a job."""
+    if jobs_collection is None: return
+
+    update_fields = {
+        "current_id": current_id,
+        "last_updated": datetime.datetime.utcnow()
+    }
+    inc_fields = {"processed": 1}
+    if not success:
+        inc_fields["failed"] = 1
+
+    jobs_collection.update_one(
+        {"_id": job_id},
+        {"$set": update_fields, "$inc": inc_fields}
+    )
+
+def cancel_job(user_id):
+    """Cancels active job for user."""
+    if jobs_collection is None: return
+    jobs_collection.update_many(
+        {"user_id": user_id, "status": "active"},
+        {"$set": {"status": "cancelled", "end_time": datetime.datetime.utcnow()}}
+    )
+
+def complete_job(job_id):
+    """Marks job as completed."""
+    if jobs_collection is None: return
+    jobs_collection.update_one(
+        {"_id": job_id},
+        {"$set": {"status": "completed", "end_time": datetime.datetime.utcnow()}}
+    )

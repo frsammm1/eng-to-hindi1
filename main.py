@@ -1,11 +1,9 @@
 import logging
 import asyncio
-import re
-import pyrogram
 from pyrogram import Client, filters
 from config import Config
-from database import check_connection, get_chat_history, add_message, clear_history
-from ai_service import get_chat_response, generate_image
+from database import check_connection, create_job, cancel_job, get_active_job
+from transfer_service import TransferEngine
 
 # Configure logging
 logging.basicConfig(
@@ -22,103 +20,146 @@ if not check_connection():
     logger.error("Could not connect to MongoDB. Exiting...")
     exit(1)
 
-app = Client(
-    "ssc_heavy_bot", # Keeping session name same to reuse session if needed
-    api_id=Config.API_ID,
-    api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
-)
+# Initialize Client
+# Logic:
+# 1. If BOT_TOKEN is present -> Start as Bot
+# 2. If SESSION_STRING is present -> Start as Userbot (Memory)
+# 3. Else -> Start as Userbot (File/Interactive Login)
+if Config.BOT_TOKEN:
+    logger.info("Starting in BOT mode (Bot Token provided).")
+    app = Client(
+        "ssc_transfer_bot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        bot_token=Config.BOT_TOKEN
+    )
+elif Config.SESSION_STRING:
+    logger.info("Starting in USERBOT mode (Session String provided).")
+    app = Client(
+        "ssc_transfer_userbot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        session_string=Config.SESSION_STRING
+    )
+else:
+    logger.info("Starting in USERBOT mode (Interactive Login).")
+    # This will check for 'my_userbot.session'.
+    # If not found, it triggers CLI login.
+    app = Client(
+        "my_userbot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH
+    )
 
-async def send_chunked_message(message, text):
-    """Splits long text into chunks to respect Telegram's limit."""
-    limit = 4096
-    if len(text) <= limit:
-        await message.reply(text)
-        return
-
-    parts = []
-    while text:
-        if len(text) <= limit:
-            parts.append(text)
-            break
-
-        # Find split point
-        split_at = text.rfind('\n', 0, limit)
-        if split_at == -1:
-            split_at = text.rfind(' ', 0, limit)
-        if split_at == -1:
-            split_at = limit
-
-        parts.append(text[:split_at])
-        text = text[split_at:].lstrip()
-
-    for part in parts:
-        await message.reply(part)
+# Initialize Transfer Engine
+engine = TransferEngine(app)
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
-    user_id = message.from_user.id
-    # Clear old history on start for a fresh conversation
-    clear_history(user_id)
-
-    welcome_text = (
-        "Hello! I am your Advanced AI Assistant. 🤖\n"
-        "I can help you with questions, research topics online, and even generate images.\n\n"
-        "• Chat with me in English or Hindi (Hinglish).\n"
-        "• Ask me about current events (I can search the web! 🌐).\n"
-        "• Use `/image [description]` to generate AI art.\n\n"
-        "How can I assist you today?"
+    text = (
+        "🚀 **Telegram Content Transfer Bot**\n\n"
+        "I can copy messages from one channel to another, one by one.\n"
+        "I handle all file types, media, and text.\n\n"
+        "**Commands:**\n"
+        "`/batch <source> <dest> <start_id> <end_id>` - Start a transfer job.\n"
+        "`/cancel` - Stop the current job.\n"
+        "`/status` - Check current status.\n\n"
+        "**Example:**\n"
+        "`/batch -1001234567890 -1009876543210 100 500`\n\n"
+        "**Note:** Ensure I am a member (or admin) in the source and destination channels."
     )
-    add_message(user_id, "assistant", welcome_text)
-    await message.reply(welcome_text)
+    await message.reply(text)
 
-@app.on_message(filters.command("reset"))
-async def reset_command(client, message):
-    clear_history(message.from_user.id)
-    await message.reply("Memory wiped! Starting a fresh session. 🔄")
-
-@app.on_message(filters.command("image"))
-async def image_command(client, message):
-    if len(message.command) < 2:
-        await message.reply("Please provide a description! Example: `/image futuristic city at night`")
+@app.on_message(filters.command("batch"))
+async def batch_command(client, message):
+    # Check permissions
+    if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
+        await message.reply("❌ Access Denied. Only the owner can use this bot.")
         return
 
-    prompt = message.text.split(None, 1)[1]
-    status_msg = await message.reply("Generating image... please wait. 🎨")
-    
+    # Check for active job
+    if get_active_job(message.from_user.id):
+        await message.reply("⚠️ You already have an active transfer job. Use `/cancel` first.")
+        return
+
+    # Parse arguments
     try:
-        image_url = await generate_image(prompt)
-        if image_url:
-            await message.reply_photo(image_url, caption=f"Generated: '{prompt}'")
-            await status_msg.delete()
-        else:
-            await status_msg.edit("Failed to generate image. Please try again.")
+        args = message.command
+        if len(args) != 5:
+            raise ValueError("Incorrect number of arguments")
+
+        source = args[1]
+        dest = args[2]
+        start_id = int(args[3])
+        end_id = int(args[4])
+
+        # Convert IDs to int if they look like ints
+        try:
+            source = int(source)
+        except: pass
+        try:
+            dest = int(dest)
+        except: pass
+
+    except Exception:
+        await message.reply(
+            "❌ **Usage Error**\n\n"
+            "Format: `/batch <source_id> <dest_id> <start_id> <end_id>`\n"
+            "Example: `/batch -1001234 -1005678 10 50`"
+        )
+        return
+
+    # Create Job
+    try:
+        job_id = create_job(message.from_user.id, source, dest, start_id, end_id)
+        if not job_id:
+            await message.reply("❌ Database Error: Could not create job.")
+            return
+
+        # Fetch the full job object to pass to engine
+        job = get_active_job(message.from_user.id)
+
+        # Start Engine
+        await engine.start_transfer(job)
+
     except Exception as e:
-        logger.error(f"Image command error: {e}")
-        await status_msg.edit("Something went wrong, sorry!")
+        logger.error(f"Error starting batch: {e}")
+        await message.reply(f"❌ Error starting transfer: {e}")
 
-@app.on_message(filters.text & filters.private)
-async def chat_handler(client, message):
+@app.on_message(filters.command("cancel"))
+async def cancel_command(client, message):
+    if Config.OWNER_ID and message.from_user.id != Config.OWNER_ID:
+        return
+
     user_id = message.from_user.id
-    user_input = message.text
 
+    # Cancel in Engine
+    stopped = await engine.stop_transfer(user_id)
 
-    # 1. Get History (before adding current message to avoid duplication in context)
-    history = get_chat_history(user_id, limit=10)
+    # Cancel in DB
+    cancel_job(user_id)
 
-    # 2. Save User Message
-    add_message(user_id, "user", user_input)
+    if stopped:
+        await message.reply("✅ Job stopped and cancelled.")
+    else:
+        await message.reply("⚠️ No active job found to cancel.")
 
-    # 3. Generate Response
-    # Send "typing" action
-    await client.send_chat_action(message.chat.id, pyrogram.enums.ChatAction.TYPING)
+@app.on_message(filters.command("status"))
+async def status_command(client, message):
+    job = get_active_job(message.from_user.id)
+    if not job:
+        await message.reply("💤 No active transfers running.")
+        return
 
-    response_text = await get_chat_response(history, user_input)
-
-    # 4. Save & Send Response
-    add_message(user_id, "assistant", response_text)
-    await send_chunked_message(message, response_text)
+    await message.reply(
+        f"🔄 **Active Job:**\n"
+        f"Source: `{job['source']}`\n"
+        f"Dest: `{job['dest']}`\n"
+        f"Current ID: `{job['current_id']}` / `{job['end_id']}`\n"
+        f"Processed: `{job['processed']}`\n"
+        f"Failed: `{job['failed']}`"
+    )
 
 if __name__ == "__main__":
-    logger.info("Advanced AI Assistant Started...")
+    logger.info("Transfer Bot Service Started...")
     app.run()
