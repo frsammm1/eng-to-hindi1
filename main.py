@@ -80,8 +80,18 @@ async def chat_handler(client, message):
              await message.reply("Baby, I keep it classy here! 😉 Ask me for something else.")
              return
 
-        # Heuristic: Treat the whole message as the prompt if it's short, or strip "send"
-        prompt = user_input.replace("send", "").replace("me", "").replace("a", "").replace("pic", "").replace("photo", "").replace("image", "").replace("of", "").strip()
+        # Heuristic: Clean up the prompt more carefully
+        prompt = user_input
+        for word in ["send", "me", "a", "pic", "photo", "image", "of"]:
+            prompt = prompt.replace(word, "", 1) # Replace only once to avoid mangling, though regex would be better.
+            # Actually, simply using the full input is usually fine for image models,
+            # but let's just strip "send me a pic of" pattern if it exists at the start.
+
+        # Better approach: Just strip the common prefix if present, otherwise use the whole text.
+        # This prevents "beach" becoming "bech" (if "a" is removed globally).
+        import re
+        prompt = re.sub(r'(?i)^(send\s+(me\s+)?(a\s+)?(pic|photo|image)\s+(of\s+)?)', '', user_input).strip()
+
         if not prompt: prompt = "beautiful girl selfie"
 
         # Notify user (Simulate AI response before action)
