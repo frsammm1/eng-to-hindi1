@@ -10,6 +10,7 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     MONGO_URI = os.getenv("MONGO_URI")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
 
     @classmethod
     def validate(cls):

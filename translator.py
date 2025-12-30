@@ -22,7 +22,7 @@ async def translate_text(text, retries=5):
                     {"role": "system", "content": "You are an SSC GS Expert. Translate the following English text to Hindi. Preserve technical terms. Output ONLY the translated text."},
                     {"role": "user", "content": text}
                 ],
-                model="llama3-70b-8192",
+                model=Config.GROQ_MODEL_NAME,
                 temperature=0.2,
             )
             return chat_completion.choices[0].message.content

@@ -123,10 +123,10 @@ async def start_process(client, message):
         
         # 2. Translation Loop (Concurrent)
         processed_in_session = 0
+        last_mini_pdf_sent_at = 0
         semaphore = asyncio.Semaphore(10) # Limit concurrent API calls to 10
 
         async def process_task(task):
-            nonlocal processed_in_session
             async with semaphore:
                 hindi = await translate_text(task['original_text'])
                 if hindi:
@@ -149,8 +149,9 @@ async def start_process(client, message):
             if processed_in_session % 50 == 0:
                  state.completed_tasks = await asyncio.to_thread(get_completed_count, file_id)
 
-            # Mini PDF every 200 questions
-            if processed_in_session > 0 and processed_in_session % 200 == 0:
+            # Mini PDF every 200 questions (logic improved to handle batch jumps)
+            if processed_in_session - last_mini_pdf_sent_at >= 200:
+                 last_mini_pdf_sent_at = processed_in_session
                  mini_name = f"batch_{processed_in_session}_{file_id[:5]}.pdf"
                  asyncio.create_task(send_mini_pdf(client, message, file_id, mini_name)) # Fire and forget
 
