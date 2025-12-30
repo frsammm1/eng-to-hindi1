@@ -1,6 +1,7 @@
 from pymongo import MongoClient
 from config import Config
 import logging
+import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,12 @@ def check_connection():
     global client, db, chats_collection
     try:
         client = MongoClient(Config.MONGO_URI)
-        db = client.get_database() # Connect to default DB in URI
+        try:
+            db = client.get_database() # Connect to default DB in URI
+        except Exception:
+            # Fallback if no default database is defined in URI
+            db = client['riya_bot']
+
         chats_collection = db['chat_history']
         # Test command
         client.admin.command('ping')
@@ -32,8 +38,6 @@ def get_chat_history(user_id, limit=10):
     except Exception as e:
         logger.error(f"Error fetching history: {e}")
         return []
-
-import datetime
 
 def add_message(user_id, role, content):
     if chats_collection is None: return

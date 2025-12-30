@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import re
 import pyrogram
 from pyrogram import Client, filters
 from config import Config
@@ -72,27 +73,30 @@ async def chat_handler(client, message):
     user_id = message.from_user.id
     user_input = message.text
 
-    # Check for implicit image requests (simple keyword check)
-    lower_input = user_input.lower()
-    if "send" in lower_input and ("pic" in lower_input or "photo" in lower_input or "image" in lower_input or "nude" in lower_input):
-        # We redirect to image generation if it looks like a request, but we sanitize "nude" requests
-        if "nude" in lower_input or "naked" in lower_input:
+    # Implicitly detect if user wants an image (Hinglish support)
+    lower_msg = user_input.lower()
+    image_triggers = ["pic", "photo", "image", "selfie", "nudes", "snap"]
+    send_triggers = ["send", "give", "bhej", "dikha", "show", "le"]
+
+    # Check intersection
+    wants_image = any(t in lower_msg for t in image_triggers) and any(s in lower_msg for s in send_triggers)
+
+    if wants_image:
+        # Sanitize "nude" requests
+        if "nude" in lower_msg or "naked" in lower_msg:
              await message.reply("Baby, I keep it classy here! 😉 Ask me for something else.")
              return
 
-        # Heuristic: Clean up the prompt more carefully
-        prompt = user_input
-        for word in ["send", "me", "a", "pic", "photo", "image", "of"]:
-            prompt = prompt.replace(word, "", 1) # Replace only once to avoid mangling, though regex would be better.
-            # Actually, simply using the full input is usually fine for image models,
-            # but let's just strip "send me a pic of" pattern if it exists at the start.
+        # Clean up the prompt to remove triggers
+        all_triggers = image_triggers + send_triggers + ["me", "a", "of", "ko", "mujhe", "ek"]
+        pattern = r'\b(' + '|'.join(map(re.escape, all_triggers)) + r')\b'
+        clean_prompt = re.sub(pattern, '', lower_msg, flags=re.IGNORECASE).strip()
 
-        # Better approach: Just strip the common prefix if present, otherwise use the whole text.
-        # This prevents "beach" becoming "bech" (if "a" is removed globally).
-        import re
-        prompt = re.sub(r'(?i)^(send\s+(me\s+)?(a\s+)?(pic|photo|image)\s+(of\s+)?)', '', user_input).strip()
+        # If the clean prompt is empty or just whitespace, fallback
+        if not clean_prompt or len(clean_prompt) < 2:
+            clean_prompt = "beautiful girl selfie" # Default fallback
 
-        if not prompt: prompt = "beautiful girl selfie"
+        prompt = clean_prompt
 
         # Notify user (Simulate AI response before action)
         status_msg = await message.reply("Sending it right now, babe! 😘")
@@ -115,11 +119,11 @@ async def chat_handler(client, message):
             await status_msg.edit("Sorry, something went wrong!")
             return
 
-    # 1. Save User Message
-    add_message(user_id, "user", user_input)
-
-    # 2. Get History
+    # 1. Get History (before adding current message to avoid duplication in context)
     history = get_chat_history(user_id, limit=10)
+
+    # 2. Save User Message
+    add_message(user_id, "user", user_input)
 
     # 3. Generate Response
     # Send "typing" action

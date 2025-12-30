@@ -1,6 +1,7 @@
 import logging
 import random
 import aiohttp
+import urllib.parse
 from groq import AsyncGroq
 from config import Config
 
@@ -48,7 +49,7 @@ async def generate_image(prompt):
     """
     # Enhance prompt for better results
     enhanced_prompt = f"realistic, high quality, 4k, {prompt}, beautiful lighting, detailed"
-    encoded_prompt = enhanced_prompt.replace(" ", "%20")
+    encoded_prompt = urllib.parse.quote(enhanced_prompt)
 
     # Random seed to ensure variety
     seed = random.randint(1, 100000)
